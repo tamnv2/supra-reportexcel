@@ -77,6 +77,11 @@ jobs:
               except Exception:
                   storage = False
           print("Storage S3: " + ("PASS" if storage else "FAIL"))
+          def domain_ok(status, data):
+              if not api_ok(status, data):
+                  return False
+              return any(v.get("hostname") == "updatereportexcel.supra.cc.cd" and v.get("service") == "updatereportexcel" and v.get("enabled", True) for v in data.get("result", []))
+          check("Domain mapping", base + "/workers/domains?hostname=updatereportexcel.supra.cc.cd", domain_ok, True)
           results = [
               worker, storage,
               check("Health", host + "/health", lambda s,d: s == 200 and d.get("status") == "ok" and d.get("storage") == "ready" and d.get("updates_enabled") is False),
