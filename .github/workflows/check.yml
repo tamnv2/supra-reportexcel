@@ -15,7 +15,7 @@ jobs:
       - name: Verify access
         shell: python
         run: |
-          import json, os, re, urllib.request, urllib.error, sys
+          import json, os, re, urllib.request, urllib.error, sys, hashlib, subprocess
           token = os.environ.get("CF_TOKEN", "")
           account = os.environ.get("CF_ACCOUNT", "")
           if not token or not re.fullmatch(r"[0-9a-fA-F]{32}", account):
@@ -58,11 +58,27 @@ jobs:
           base = "https://api.cloudflare.com/client/v4/accounts/" + account
           host = "https://updatereportexcel.supra.cc.cd"
           api_ok = lambda status, data: status == 200 and data.get("success") is True
-          check("Account token", base + "/tokens/verify", lambda s,d: s == 200 and d.get("result", {}).get("status") == "active", True)
-          check("User token", "https://api.cloudflare.com/client/v4/user/tokens/verify", lambda s,d: s == 200 and d.get("result", {}).get("status") == "active", True)
+          verified = {}
+          def token_ok(status, data):
+              if status == 200 and data.get("result", {}).get("status") == "active":
+                  verified.update(data["result"])
+                  return True
+              return False
+          active = check("Account token", base + "/tokens/verify", token_ok, True)
+          worker = check("Worker", base + "/workers/scripts/updatereportexcel/script-settings", api_ok, True)
+          if not worker:
+              check("Worker alias", base + "/workers/scripts/suprareportexcel/script-settings", api_ok, True)
+          storage = False
+          if active and verified.get("id"):
+              env = dict(os.environ, AWS_ACCESS_KEY_ID=verified["id"], AWS_SECRET_ACCESS_KEY=hashlib.sha256(token.encode()).hexdigest(), AWS_DEFAULT_REGION="auto", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true", AWS_MAX_ATTEMPTS="1")
+              try:
+                  res = subprocess.run(["aws", "s3api", "list-objects-v2", "--bucket", "supra-reportexcel-releases", "--max-keys", "1", "--no-paginate", "--endpoint-url", "https://" + account + ".r2.cloudflarestorage.com", "--cli-connect-timeout", "15", "--cli-read-timeout", "15"], env=env, capture_output=True, timeout=40)
+                  storage = res.returncode == 0
+              except Exception:
+                  storage = False
+          print("Storage S3: " + ("PASS" if storage else "FAIL"))
           results = [
-              check("Worker", base + "/workers/scripts/updatereportexcel/script-settings", api_ok, True),
-              check("Storage API", base + "/r2/buckets/supra-reportexcel-releases/objects?limit=1", api_ok, True),
+              worker, storage,
               check("Health", host + "/health", lambda s,d: s == 200 and d.get("status") == "ok" and d.get("storage") == "ready" and d.get("updates_enabled") is False),
               check("Manifest", host + "/manifest.json", lambda s,d: s == 404 and d.get("error") == "NO_RELEASE"),
           ]
