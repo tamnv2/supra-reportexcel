@@ -56,7 +56,7 @@ jobs:
           verified = api("Account token", base + "/tokens/verify")
           if not isinstance(verified, dict) or verified.get("status") != "active":
               sys.exit("Token inactive")
-          settings = api("Worker settings", script + "/script-settings")
+          settings = api("Worker version settings", script + "/settings")
           domains = api("Domain mapping", base + "/workers/domains?hostname=updatereportexcel.supra.cc.cd")
           mapped = isinstance(domains, list) and any(v.get("hostname") == "updatereportexcel.supra.cc.cd" and v.get("service") == "updatereportexcel" and v.get("enabled", True) for v in domains)
           print("Exact domain mapping: " + ("PASS" if mapped else "FAIL"))
@@ -79,6 +79,7 @@ jobs:
               elif "multipart/" in headers.get("Content-Type", ""):
                   msg = email.message_from_bytes(("Content-Type: " + headers["Content-Type"] + "\r\n\r\n").encode() + body, policy=policy.default)
                   same = any(part.get_payload(decode=True) == expected for part in msg.iter_parts())
+          print("Pinned source download: HTTP " + str(ss))
           print("Worker content: HTTP " + str(status) + "; matches pinned bootstrap: " + ("YES" if same else "NOT VERIFIED"))
           env = dict(os.environ, AWS_ACCESS_KEY_ID=verified["id"], AWS_SECRET_ACCESS_KEY=hashlib.sha256(token.encode()).hexdigest(), AWS_DEFAULT_REGION="auto", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true", AWS_MAX_ATTEMPTS="1")
           def s3(operation, *args):
@@ -116,10 +117,13 @@ jobs:
               ok = (status == 200 and data.get("status") == "ok" and data.get("storage") == "ready" and data.get("updates_enabled") is False) if path == "/health" else (status == 404 and data.get("error") == "NO_RELEASE")
               low = body.lower()
               flags = []
-              for tag, hit in [("challenge", headers.get("cf-mitigated") == "challenge"), ("access", "cloudflareaccess.com" in headers.get("Location", "") or b"cloudflare access" in low), ("cloudflare-page", b"cloudflare" in low), ("error-1010", b"1010" in low), ("error-1020", b"1020" in low), ("blocked", b"blocked" in low), ("json", bool(data)), ("ray-present", bool(headers.get("cf-ray")))]:
+              for tag, hit in [("challenge", headers.get("cf-mitigated") == "challenge"), ("access", "cloudflareaccess.com" in headers.get("Location", "") or b"cloudflare access" in low), ("cloudflare-page", b"cloudflare" in low), ("error-1010", bool(re.search(rb"(?:error\s*(?:code\s*)?[:#]?\s*1010|>\s*1010\s*<)", low))), ("error-1020", b"1020" in low), ("blocked", b"blocked" in low), ("json", bool(data)), ("ray-present", bool(headers.get("cf-ray")))]:
                   if hit: flags.append(tag)
               print("Endpoint " + path + ": " + str(status) + (" PASS" if ok else " FAIL") + " [" + ",".join(flags) + "]")
               return ok
-          health = probe("/health")
-          manifest = probe("/manifest.json")
-          sys.exit(0 if all([mapped, binding_ok, listed, absent, written, readback, deleted, health, manifest]) else 1)
+          print("Default HTTP client:")
+          probe("/health")
+          print("Identified update client:")
+          health = probe("/health", "SupraReportExcel-Updater/1.0")
+          manifest = probe("/manifest.json", "SupraReportExcel-Updater/1.0")
+          sys.exit(0 if all([mapped, binding_ok, same, listed, absent, written, readback, deleted, health, manifest]) else 1)
