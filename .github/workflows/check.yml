@@ -11,7 +11,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     env:
       CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -126,4 +126,95 @@ jobs:
           print("Identified update client:")
           health = probe("/health", "SupraReportExcel-Updater/1.0")
           manifest = probe("/manifest.json", "SupraReportExcel-Updater/1.0")
-          sys.exit(0 if all([mapped, binding_ok, same, listed, absent, written, readback, deleted, health, manifest]) else 1)
+          if not all([mapped, binding_ok, listed, absent, written, readback, deleted, health, manifest]):
+              sys.exit("Bootstrap deployment preflight failed")
+          if same:
+              print("Bootstrap already matches; deployment not needed")
+              sys.exit(0)
+          if os.environ.get("GITHUB_EVENT_NAME") != "push" or os.environ.get("GITHUB_REF") != "refs/heads/infra-check" or parse(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes()).get("head_commit", {}).get("message") != "ci: deploy approved bootstrap with rollback":
+              sys.exit("Read-only check: source differs; no deployment attempted")
+          if ss != 200 or hashlib.sha1(b"blob " + str(len(expected)).encode() + b"\x00" + expected).hexdigest() != "db7a747fd61a638e07b04a5ef9635ae0e2ea1e93":
+              sys.exit("Pinned source integrity failed")
+          test_status, _, tests = request(source_url.replace("src/worker.mjs", "test/worker.test.mjs"))
+          if test_status != 200 or hashlib.sha1(b"blob " + str(len(tests)).encode() + b"\x00" + tests).hexdigest() != "5ee74df8848bbb0c2cb5e655f9da9f766ee05634":
+              sys.exit("Pinned tests integrity failed")
+          with tempfile.TemporaryDirectory() as tmp:
+              root = pathlib.Path(tmp)
+              (root / "src").mkdir()
+              (root / "test").mkdir()
+              (root / "src/worker.mjs").write_bytes(expected)
+              (root / "test/worker.test.mjs").write_bytes(tests)
+              result = subprocess.run(["node", "--test", str(root / "test/worker.test.mjs")], cwd=tmp, capture_output=True, timeout=20)
+              print("Bootstrap unit tests: " + ("PASS" if result.returncode == 0 else "FAIL"))
+              if result.returncode:
+                  sys.exit(1)
+          ds = deployment.get("deployments") or [] if isinstance(deployment, dict) else []
+          old = ds[0].get("versions") or [] if ds else []
+          if len(old) != 1 or old[0].get("percentage") != 100 or not re.fullmatch(r"[0-9a-fA-F-]{36}", str(old[0].get("version_id", ""))):
+              sys.exit("Cannot establish rollback version")
+          old_id = old[0]["version_id"]
+          def post(label, url, data, content_type):
+              try:
+                  req = urllib.request.Request(url, data=data, headers={"Authorization": "Bearer " + token, "Content-Type": content_type}, method="POST")
+                  with opener.open(req, timeout=25) as res:
+                      status, payload = res.status, parse(res.read(1048576))
+              except urllib.error.HTTPError as exc:
+                  status, payload = exc.code, parse(exc.read(1048576))
+              except Exception:
+                  status, payload = 0, {}
+              ok = 200 <= status < 300 and payload.get("success") is True
+              codes = [str(v["code"]) for v in (payload.get("errors") or []) if isinstance(v, dict) and isinstance(v.get("code"), int)]
+              print(label + ": " + str(status) + (" PASS" if ok else " FAIL") + (" codes=" + ",".join(codes) if codes else ""))
+              return payload.get("result") if ok else None
+          marker = "bootstrap-db7a747fd61a638e07b04a5ef9635ae0e2ea1e93"
+          previous = api("Active version details", script + "/versions/" + old_id)
+          if not isinstance(previous, dict):
+              sys.exit("Cannot verify rollback version")
+          # Never replace a deployment that includes unexpected bindings.
+          prior_bindings = (previous.get("resources") or {}).get("bindings")
+          if not isinstance(prior_bindings, list) or len(prior_bindings) != 1 or not any(b.get("name") == "RELEASES" and b.get("type") == "r2_bucket" and b.get("bucket_name") == "supra-reportexcel-releases" for b in prior_bindings):
+              sys.exit("Active version bindings not verified")
+          # A tagged, verified version needs no repeat upload.
+          annotation = previous.get("annotations") or {}
+          if annotation.get("workers/tag") == marker:
+              print("Pinned bootstrap version already active")
+              sys.exit(0)
+          meta = {"main_module": "worker.mjs", "compatibility_date": "2026-11-25", "bindings": [{"name":"RELEASES","type":"r2_bucket","bucket_name":"supra-reportexcel-releases"}], "annotations":{"workers/tag":marker}}
+          boundary = "bootstrap-" + uuid.uuid4().hex
+          sep = ("--" + boundary + "\r\n").encode()
+          def part(name, typ, data, filename=None):
+              disposition = 'Content-Disposition: form-data; name="' + name + '"' + ('; filename="' + filename + '"' if filename else '')
+              return sep + (disposition + "\r\nContent-Type: " + typ + "\r\n\r\n").encode() + data + b"\r\n"
+          data = part("metadata","application/json",json.dumps(meta).encode()) + part("worker.mjs","application/javascript+module",expected,"worker.mjs") + ("--" + boundary + "--\r\n").encode()
+          uploaded = post("Upload pinned bootstrap version", script + "/versions", data, "multipart/form-data; boundary=" + boundary)
+          new_id = uploaded.get("id", "") if isinstance(uploaded, dict) else ""
+          if not re.fullmatch(r"[0-9a-fA-F-]{36}", new_id):
+              sys.exit("Upload not confirmed; no activation attempted")
+          # Ensure the currently deployed version has not changed in the meantime.
+          latest = api("Pre-activation deployment check", script + "/deployments")
+          latest_ds = latest.get("deployments") or [] if isinstance(latest, dict) else []
+          if not latest_ds or latest_ds[0].get("id") != ds[0].get("id"):
+              sys.exit("Deployment changed concurrently; no activation attempted")
+          def activate(label, version):
+              return post(label, script + "/deployments", json.dumps({"strategy":"percentage","versions":[{"version_id":version,"percentage":100}]}).encode(), "application/json")
+          def current_version():
+              result = api("Active deployment verification", script + "/deployments")
+              items = result.get("deployments") or [] if isinstance(result, dict) else []
+              versions = items[0].get("versions") or [] if items else []
+              return versions[0].get("version_id") if len(versions) == 1 and versions[0].get("percentage") == 100 else None
+          try:
+              deployed = activate("Activate bootstrap", new_id)
+              if not deployed or current_version() != new_id:
+                  raise RuntimeError("Activation not verified")
+              import time
+              time.sleep(4)
+              if not probe("/health", "SupraReportExcel-Updater/1.0") or not probe("/manifest.json", "SupraReportExcel-Updater/1.0"):
+                  raise RuntimeError("Smoke test failed")
+              print("Bootstrap deployment and smoke test: PASS")
+          except Exception:
+              if current_version() == new_id:
+                  rolled = activate("Rollback bootstrap", old_id)
+                  print("Rollback verified: " + ("PASS" if rolled and current_version() == old_id else "FAIL"))
+              else:
+                  print("Rollback not attempted: new version not confirmed active")
+              sys.exit(1)
