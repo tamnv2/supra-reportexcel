@@ -50,7 +50,7 @@ jobs:
               status, headers, body = request(url, True)
               data = parse(body)
               ok = status == 200 and data.get("success") is True
-              codes = [str(v["code"]) for v in data.get("errors", []) if isinstance(v, dict) and isinstance(v.get("code"), int)]
+              codes = [str(v["code"]) for v in (data.get("errors") or []) if isinstance(v, dict) and isinstance(v.get("code"), int)]
               print(label + ": " + str(status) + (" PASS" if ok else " FAIL") + (" codes=" + ",".join(codes) if codes else ""))
               return data.get("result") if ok else None
           verified = api("Account token", base + "/tokens/verify")
@@ -60,15 +60,15 @@ jobs:
           domains = api("Domain mapping", base + "/workers/domains?hostname=updatereportexcel.supra.cc.cd")
           mapped = isinstance(domains, list) and any(v.get("hostname") == "updatereportexcel.supra.cc.cd" and v.get("service") == "updatereportexcel" and v.get("enabled", True) for v in domains)
           print("Exact domain mapping: " + ("PASS" if mapped else "FAIL"))
-          bindings = settings.get("bindings", []) if isinstance(settings, dict) else []
+          bindings = (settings.get("bindings") or []) if isinstance(settings, dict) else []
           binding_ok = len(bindings) == 1 and any(b.get("name") == "RELEASES" and b.get("type") == "r2_bucket" and b.get("bucket_name") == "supra-reportexcel-releases" for b in bindings)
           print("Exact R2 binding: " + ("PASS" if binding_ok else "FAIL"))
           deployment = api("Deployment history", script + "/deployments")
           if isinstance(deployment, dict):
-              ds = deployment.get("deployments", [])
+              ds = (deployment.get("deployments") or [])
               print("Deployment exists: " + ("YES" if ds else "NO"))
               if ds:
-                  print("Latest deployment versions: " + str(len(ds[0].get("versions", []))))
+                  print("Latest deployment versions: " + str(len((ds[0].get("versions") or []))))
           source_url = "https://raw.githubusercontent.com/tamnv2/supra-reportexcel/3f386afc1a2b780da54e7779b5b81c275558cee1/src/worker.mjs"
           ss, _, expected = request(source_url)
           status, headers, body = request(script + "/content/v2", True)
@@ -88,7 +88,7 @@ jobs:
               except Exception:
                   return False, b""
           listed, raw = s3("list-objects-v2", "--prefix", "manifest.json", "--max-keys", "1", "--no-paginate")
-          absent = listed and not any(v.get("Key") == "manifest.json" for v in parse(raw).get("Contents", []))
+          absent = listed and not any(v.get("Key") == "manifest.json" for v in (parse(raw).get("Contents") or []))
           print("R2 read: " + ("PASS" if listed else "FAIL"))
           print("No active manifest: " + ("PASS" if absent else "FAIL"))
           key = "_diagnostics/" + uuid.uuid4().hex + ".txt"
