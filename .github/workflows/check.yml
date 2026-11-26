@@ -1,0 +1,59 @@
+name: Infrastructure check
+on:
+  push:
+    branches: [infra-check]
+    paths: ['.github/workflows/check.yml']
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Verify access
+        shell: python
+        run: |
+          import json, os, re, urllib.request, urllib.error, sys
+          token = os.environ.get("CF_TOKEN", "")
+          account = os.environ.get("CF_ACCOUNT", "")
+          if not token or not re.fullmatch(r"[0-9a-fA-F]{32}", account):
+              print("Credentials: missing or invalid format")
+              sys.exit(1)
+          print("Credentials: present")
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect())
+          def check(label, url, predicate, auth=False):
+              headers = {"Authorization": "Bearer " + token} if auth else {}
+              try:
+                  with opener.open(urllib.request.Request(url, headers=headers), timeout=15) as res:
+                      status = res.status
+                      data = json.load(res)
+              except urllib.error.HTTPError as e:
+                  status = e.code
+                  if not auth and status == 404:
+                      try:
+                          data = json.load(e)
+                      except Exception:
+                          data = {}
+                  else:
+                      data = {}
+              except Exception:
+                  print(label + ": connection failed")
+                  return False
+              ok = predicate(status, data)
+              print(label + ": " + str(status) + (" PASS" if ok else " FAIL"))
+              return ok
+          base = "https://api.cloudflare.com/client/v4/accounts/" + account
+          host = "https://updatereportexcel.supra.cc.cd"
+          api_ok = lambda status, data: status == 200 and data.get("success") is True
+          results = [
+              check("Worker", base + "/workers/scripts/updatereportexcel/script-settings", api_ok, True),
+              check("Storage API", base + "/r2/buckets/supra-reportexcel-releases/objects?limit=1", api_ok, True),
+              check("Health", host + "/health", lambda s,d: s == 200 and d.get("status") == "ok" and d.get("storage") == "ready" and d.get("updates_enabled") is False),
+              check("Manifest", host + "/manifest.json", lambda s,d: s == 404 and d.get("error") == "NO_RELEASE"),
+          ]
+          sys.exit(0 if all(results) else 1)
