@@ -3,88 +3,123 @@ on:
   push:
     branches: [infra-check]
     paths: ['.github/workflows/check.yml']
+  workflow_dispatch:
 permissions: {}
+concurrency:
+  group: infrastructure-check
+  cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     env:
       CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - name: Verify access
+      - name: Inspect bootstrap and verify private storage
         shell: python
         run: |
-          import json, os, re, urllib.request, urllib.error, sys, hashlib, subprocess
+          import json, os, re, urllib.request, urllib.error, sys, hashlib, subprocess, tempfile, uuid, pathlib, email
+          from email import policy
           token = os.environ.get("CF_TOKEN", "")
           account = os.environ.get("CF_ACCOUNT", "")
           if not token or not re.fullmatch(r"[0-9a-fA-F]{32}", account):
-              print("Credentials: missing or invalid format")
-              sys.exit(1)
-          print("Credentials: present")
+              sys.exit("Credentials: missing or invalid format")
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, *args, **kwargs):
                   return None
           opener = urllib.request.build_opener(NoRedirect())
-          def check(label, url, predicate, auth=False):
+          base = "https://api.cloudflare.com/client/v4/accounts/" + account
+          script = base + "/workers/scripts/updatereportexcel"
+          host = "https://updatereportexcel.supra.cc.cd"
+          def request(url, auth=False, agent=None):
               headers = {"Authorization": "Bearer " + token} if auth else {}
+              if agent:
+                  headers["User-Agent"] = agent
               try:
                   with opener.open(urllib.request.Request(url, headers=headers), timeout=15) as res:
-                      status = res.status
-                      data = json.load(res)
+                      return res.status, res.headers, res.read(1048576)
               except urllib.error.HTTPError as e:
-                  status = e.code
-                  if not auth and status == 404:
-                      try:
-                          data = json.load(e)
-                      except Exception:
-                          data = {}
-                  else:
-                      try:
-                          payload = json.load(e)
-                          codes = [v.get("code") for v in payload.get("errors", []) if isinstance(v, dict) and isinstance(v.get("code"), int)]
-                      except Exception:
-                          codes = []
-                      print(label + ": error codes " + ",".join(map(str, codes)))
-                      if e.headers.get("cf-mitigated") == "challenge":
-                          print(label + ": challenge")
-                      data = {}
+                  return e.code, e.headers, e.read(1048576)
               except Exception:
-                  print(label + ": connection failed")
-                  return False
-              ok = predicate(status, data)
-              print(label + ": " + str(status) + (" PASS" if ok else " FAIL"))
-              return ok
-          base = "https://api.cloudflare.com/client/v4/accounts/" + account
-          host = "https://updatereportexcel.supra.cc.cd"
-          api_ok = lambda status, data: status == 200 and data.get("success") is True
-          verified = {}
-          def token_ok(status, data):
-              if status == 200 and data.get("result", {}).get("status") == "active":
-                  verified.update(data["result"])
-                  return True
-              return False
-          active = check("Account token", base + "/tokens/verify", token_ok, True)
-          worker = check("Worker", base + "/workers/scripts/updatereportexcel/script-settings", api_ok, True)
-          if not worker:
-              check("Worker alias", base + "/workers/scripts/suprareportexcel/script-settings", api_ok, True)
-          storage = False
-          if active and verified.get("id"):
-              env = dict(os.environ, AWS_ACCESS_KEY_ID=verified["id"], AWS_SECRET_ACCESS_KEY=hashlib.sha256(token.encode()).hexdigest(), AWS_DEFAULT_REGION="auto", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true", AWS_MAX_ATTEMPTS="1")
+                  return 0, {}, b""
+          def parse(body):
+              try: return json.loads(body)
+              except Exception: return {}
+          def api(label, url):
+              status, headers, body = request(url, True)
+              data = parse(body)
+              ok = status == 200 and data.get("success") is True
+              codes = [str(v["code"]) for v in data.get("errors", []) if isinstance(v, dict) and isinstance(v.get("code"), int)]
+              print(label + ": " + str(status) + (" PASS" if ok else " FAIL") + (" codes=" + ",".join(codes) if codes else ""))
+              return data.get("result") if ok else None
+          verified = api("Account token", base + "/tokens/verify")
+          if not isinstance(verified, dict) or verified.get("status") != "active":
+              sys.exit("Token inactive")
+          settings = api("Worker settings", script + "/script-settings")
+          domains = api("Domain mapping", base + "/workers/domains?hostname=updatereportexcel.supra.cc.cd")
+          mapped = isinstance(domains, list) and any(v.get("hostname") == "updatereportexcel.supra.cc.cd" and v.get("service") == "updatereportexcel" and v.get("enabled", True) for v in domains)
+          print("Exact domain mapping: " + ("PASS" if mapped else "FAIL"))
+          bindings = settings.get("bindings", []) if isinstance(settings, dict) else []
+          binding_ok = len(bindings) == 1 and any(b.get("name") == "RELEASES" and b.get("type") == "r2_bucket" and b.get("bucket_name") == "supra-reportexcel-releases" for b in bindings)
+          print("Exact R2 binding: " + ("PASS" if binding_ok else "FAIL"))
+          deployment = api("Deployment history", script + "/deployments")
+          if isinstance(deployment, dict):
+              ds = deployment.get("deployments", [])
+              print("Deployment exists: " + ("YES" if ds else "NO"))
+              if ds:
+                  print("Latest deployment versions: " + str(len(ds[0].get("versions", []))))
+          source_url = "https://raw.githubusercontent.com/tamnv2/supra-reportexcel/3f386afc1a2b780da54e7779b5b81c275558cee1/src/worker.mjs"
+          ss, _, expected = request(source_url)
+          status, headers, body = request(script + "/content/v2", True)
+          same = False
+          if status == 200 and ss == 200:
+              if body == expected:
+                  same = True
+              elif "multipart/" in headers.get("Content-Type", ""):
+                  msg = email.message_from_bytes(("Content-Type: " + headers["Content-Type"] + "\r\n\r\n").encode() + body, policy=policy.default)
+                  same = any(part.get_payload(decode=True) == expected for part in msg.iter_parts())
+          print("Worker content: HTTP " + str(status) + "; matches pinned bootstrap: " + ("YES" if same else "NOT VERIFIED"))
+          env = dict(os.environ, AWS_ACCESS_KEY_ID=verified["id"], AWS_SECRET_ACCESS_KEY=hashlib.sha256(token.encode()).hexdigest(), AWS_DEFAULT_REGION="auto", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true", AWS_MAX_ATTEMPTS="1")
+          def s3(operation, *args):
               try:
-                  res = subprocess.run(["aws", "s3api", "list-objects-v2", "--bucket", "supra-reportexcel-releases", "--max-keys", "1", "--no-paginate", "--endpoint-url", "https://" + account + ".r2.cloudflarestorage.com", "--cli-connect-timeout", "15", "--cli-read-timeout", "15"], env=env, capture_output=True, timeout=40)
-                  storage = res.returncode == 0
+                  res = subprocess.run(["aws", "s3api", operation, "--bucket", "supra-reportexcel-releases", "--endpoint-url", "https://" + account + ".r2.cloudflarestorage.com", "--cli-connect-timeout", "10", "--cli-read-timeout", "10", *args], env=env, capture_output=True, timeout=25)
+                  return res.returncode == 0, res.stdout
               except Exception:
-                  storage = False
-          print("Storage S3: " + ("PASS" if storage else "FAIL"))
-          def domain_ok(status, data):
-              if not api_ok(status, data):
-                  return False
-              return any(v.get("hostname") == "updatereportexcel.supra.cc.cd" and v.get("service") == "updatereportexcel" and v.get("enabled", True) for v in data.get("result", []))
-          check("Domain mapping", base + "/workers/domains?hostname=updatereportexcel.supra.cc.cd", domain_ok, True)
-          results = [
-              worker, storage,
-              check("Health", host + "/health", lambda s,d: s == 200 and d.get("status") == "ok" and d.get("storage") == "ready" and d.get("updates_enabled") is False),
-              check("Manifest", host + "/manifest.json", lambda s,d: s == 404 and d.get("error") == "NO_RELEASE"),
-          ]
-          sys.exit(0 if all(results) else 1)
+                  return False, b""
+          listed, raw = s3("list-objects-v2", "--prefix", "manifest.json", "--max-keys", "1", "--no-paginate")
+          absent = listed and not any(v.get("Key") == "manifest.json" for v in parse(raw).get("Contents", []))
+          print("R2 read: " + ("PASS" if listed else "FAIL"))
+          print("No active manifest: " + ("PASS" if absent else "FAIL"))
+          key = "_diagnostics/" + uuid.uuid4().hex + ".txt"
+          written = readback = deleted = False
+          with tempfile.TemporaryDirectory() as tmp:
+              src = pathlib.Path(tmp) / "probe"
+              dst = pathlib.Path(tmp) / "readback"
+              src.write_bytes(b"bootstrap storage probe\n")
+              if listed:
+                  try:
+                      written, _ = s3("put-object", "--key", key, "--body", str(src), "--if-none-match", "*")
+                      if written:
+                          got, _ = s3("get-object", "--key", key, str(dst))
+                          readback = got and dst.read_bytes() == src.read_bytes()
+                  finally:
+                      deleted, _ = s3("delete-object", "--key", key)
+                      if deleted:
+                          ok, raw = s3("list-objects-v2", "--prefix", key, "--max-keys", "1", "--no-paginate")
+                          deleted = ok and not parse(raw).get("Contents")
+          for label, ok in [("R2 write", written), ("R2 readback", readback), ("R2 cleanup", deleted)]:
+              print(label + ": " + ("PASS" if ok else "FAIL"))
+          def probe(path, agent=None):
+              status, headers, body = request(host + path, agent=agent)
+              data = parse(body)
+              ok = (status == 200 and data.get("status") == "ok" and data.get("storage") == "ready" and data.get("updates_enabled") is False) if path == "/health" else (status == 404 and data.get("error") == "NO_RELEASE")
+              low = body.lower()
+              flags = []
+              for tag, hit in [("challenge", headers.get("cf-mitigated") == "challenge"), ("access", "cloudflareaccess.com" in headers.get("Location", "") or b"cloudflare access" in low), ("cloudflare-page", b"cloudflare" in low), ("error-1010", b"1010" in low), ("error-1020", b"1020" in low), ("blocked", b"blocked" in low), ("json", bool(data)), ("ray-present", bool(headers.get("cf-ray")))]:
+                  if hit: flags.append(tag)
+              print("Endpoint " + path + ": " + str(status) + (" PASS" if ok else " FAIL") + " [" + ",".join(flags) + "]")
+              return ok
+          health = probe("/health")
+          manifest = probe("/manifest.json")
+          sys.exit(0 if all([mapped, binding_ok, listed, absent, written, readback, deleted, health, manifest]) else 1)
