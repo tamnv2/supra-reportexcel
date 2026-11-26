@@ -40,6 +40,14 @@ jobs:
                       except Exception:
                           data = {}
                   else:
+                      try:
+                          payload = json.load(e)
+                          codes = [v.get("code") for v in payload.get("errors", []) if isinstance(v, dict) and isinstance(v.get("code"), int)]
+                      except Exception:
+                          codes = []
+                      print(label + ": error codes " + ",".join(map(str, codes)))
+                      if e.headers.get("cf-mitigated") == "challenge":
+                          print(label + ": challenge")
                       data = {}
               except Exception:
                   print(label + ": connection failed")
@@ -50,6 +58,8 @@ jobs:
           base = "https://api.cloudflare.com/client/v4/accounts/" + account
           host = "https://updatereportexcel.supra.cc.cd"
           api_ok = lambda status, data: status == 200 and data.get("success") is True
+          check("Account token", base + "/tokens/verify", lambda s,d: s == 200 and d.get("result", {}).get("status") == "active", True)
+          check("User token", "https://api.cloudflare.com/client/v4/user/tokens/verify", lambda s,d: s == 200 and d.get("result", {}).get("status") == "active", True)
           results = [
               check("Worker", base + "/workers/scripts/updatereportexcel/script-settings", api_ok, True),
               check("Storage API", base + "/r2/buckets/supra-reportexcel-releases/objects?limit=1", api_ok, True),
