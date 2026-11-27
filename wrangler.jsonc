@@ -15,5 +15,8 @@
       "binding": "RELEASES",
       "bucket_name": "supra-reportexcel-releases"
     }
-  ]
+  ],
+  "vars": {
+    "ACCEPTANCE_ENABLED": "1"
+  }
 }
